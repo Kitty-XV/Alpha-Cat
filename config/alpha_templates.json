@@ -1,0 +1,48 @@
+{
+  "1": {
+    "language": "FASTEXPR",
+    "instrument_type": "EQUITY",
+    "region": "CN",
+    "universe": "TOP3000",
+    "delay": 0,
+    "neutralization": "INDUSTRY",
+    "decay": 0,
+    "truncation": 8,
+    "pasteurization": "ON",
+    "unit_handling": "VERIFY",
+    "nan_handling": "ON",
+    "alpha_expression": "$close$aaaa"
+  },
+  "123": {
+    "language": "FASTEXPR",
+    "instrument_type": "EQUITY",
+    "region": "CN",
+    "universe": "TOP3000",
+    "delay": 0,
+    "neutralization": "INDUSTRY",
+    "decay": 0,
+    "truncation": 8,
+    "pasteurization": "OFF",
+    "unit_handling": "VERIFY",
+    "nan_handling": "ON",
+    "alpha_expression": "$close$aaaa"
+  },
+  "321": {
+    "language": "FASTEXPR",
+    "instrument_type": "EQUITY",
+    "region": "CN",
+    "universe": "TOP3000",
+    "delay": 0,
+    "neutralization": "INDUSTRY",
+    "decay": 0,
+    "truncation": 8,
+    "pasteurization": "OFF",
+    "unit_handling": "VERIFY",
+    "nan_handling": "ON",
+    "alpha_expression": "$close$aaaa",
+    "name": "321",
+    "category": "动量",
+    "description": "",
+    "created_time": "2025-01-19T14:34:29"
+  }
+}
