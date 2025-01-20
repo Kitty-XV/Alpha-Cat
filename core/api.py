@@ -37,14 +37,23 @@ class WQBrainAPI:
             
             # 发送认证请求
             print("正在发送认证请求...")
-            response = self.session.post(f'{self.base_url}/authentication')
-            
+            try:
+                response = self.session.post(f'{self.base_url}/authentication', verify=True, timeout=10)
+            except requests.exceptions.SSLError as e:
+                return False, "网络连接错误：请检查您的网络连接或代理设置"
+            except requests.exceptions.Timeout:
+                return False, "连接超时：服务器响应时间过长，请稍后重试"
+            except requests.exceptions.ConnectionError:
+                return False, "连接失败：无法连接到服务器，请检查网络设置"
+            except Exception as e:
+                return False, f"网络请求错误：{str(e)}"
+                
             if response.status_code == 401:
                 return False, "用户名或密码不正确"
             elif response.status_code not in [200, 201]:
                 print("认证状态码:", response.status_code)
-                print("认证响应:", response.json())
-                return False, "认证失败，请检查网络连接"
+                print("认证响应:", response.text)
+                return False, f"认证失败 (HTTP {response.status_code})"
                 
             # 获取认证信息
             auth_info = response.json()
@@ -71,10 +80,12 @@ class WQBrainAPI:
             
         except FileNotFoundError:
             return False, "找不到凭证文件，请重新输入用户名密码"
+        except json.JSONDecodeError:
+            return False, "凭证文件格式错误，请重新输入用户名密码"
         except KeyError as e:
             return False, "服务器响应格式错误"
         except Exception as e:
-            return False, str(e)
+            return False, f"登录过程出错: {str(e)}"
 
     def clear_cache(self):
         """

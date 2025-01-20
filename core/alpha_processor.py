@@ -9,7 +9,9 @@ class AlphaProcessor:
     @staticmethod
     def format_expression(expression: str) -> str:
         """
-        格式化Alpha表达式，将$包围的变量替换为正确的格式
+        格式化Alpha表达式，在以下两种格式之间转换:
+        1. $var$ 格式 -> {var} 格式 (用于保存到模板)
+        2. {var} 格式 -> $var$ 格式 (从模板读取时)
         
         Args:
             expression: 原始Alpha表达式
@@ -17,17 +19,25 @@ class AlphaProcessor:
         Returns:
             格式化后的表达式
         """
-        # 使用正则表达式匹配$之间的内容
-        pattern = r'\$(.*?)\$'
-        
-        def replace_var(match):
-            """替换变量"""
-            var = match.group(1).strip()
-            return f"{{{var}}}"
+        if not expression:
+            return ""
             
-        # 替换所有匹配项
-        formatted = re.sub(pattern, replace_var, expression)
-        return formatted
+        # 检查是否包含$符号，如果包含则转换为{}格式
+        if '$' in expression:
+            pattern = r'\$(.*?)\$'
+            def replace_var(match):
+                var = match.group(1).strip()
+                return f"{{{var}}}"
+            return re.sub(pattern, replace_var, expression)
+        # 如果包含{}则转换为$$格式
+        elif '{' in expression:
+            pattern = r'\{(.*?)\}'
+            def replace_var(match):
+                var = match.group(1).strip()
+                return f"${var}$"
+            return re.sub(pattern, replace_var, expression)
+        else:
+            return expression
         
     @staticmethod
     def validate_expression(expression: str) -> bool:

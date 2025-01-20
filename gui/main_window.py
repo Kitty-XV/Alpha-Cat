@@ -8,6 +8,7 @@ from PyQt6.QtCore import Qt
 from .settings_window import SettingsWidget
 from .data_fields_window import DataFieldsWidget
 from .alpha_settings_window import AlphaSettingsWindow
+from .backtest_window import BacktestWindow
 
 class MainWindow(QMainWindow):
     """主窗口类"""
@@ -36,6 +37,7 @@ class MainWindow(QMainWindow):
         
         # 创建堆叠窗口部件用于切换不同页面
         self.stacked_widget = QStackedWidget()
+        content_layout.addWidget(self.stacked_widget)
         
         # 创建并添加各个页面
         self.settings_widget = SettingsWidget()
@@ -50,15 +52,14 @@ class MainWindow(QMainWindow):
         self.alpha_widget = AlphaSettingsWindow()
         self.stacked_widget.addWidget(self.alpha_widget)
         
-        self.backtest_widget = QWidget()
-        self.backtest_widget.setStyleSheet("background-color: #F5F5F5;")
+        # 创建回测界面
+        self.backtest_widget = BacktestWindow()
         self.stacked_widget.addWidget(self.backtest_widget)
         
         self.batch_widget = QWidget()
         self.batch_widget.setStyleSheet("background-color: #F5F5F5;")
         self.stacked_widget.addWidget(self.batch_widget)
         
-        content_layout.addWidget(self.stacked_widget)
         main_layout.addWidget(content_widget)
         
         # 默认显示设置页面
@@ -108,7 +109,6 @@ class MainWindow(QMainWindow):
             nav_layout.addWidget(button)
             self.nav_buttons.append(button)
             
-        # 添加弹性空间
         nav_layout.addStretch()
         
         # 添加用户信息标签
@@ -149,12 +149,16 @@ class MainWindow(QMainWindow):
             self.user_label.setText(f"用户ID: {user_id}")
             # 设置数据字段页面的session
             self.data_widget.set_session(self.settings_widget.api.session)
+            # 设置回测页面的session
+            self.backtest_widget.set_session(self.settings_widget.api.session)
             
     def clear_user_info(self):
         """清除用户信息显示"""
         self.user_label.setText("")
         # 清除数据字段页面的session
         self.data_widget.set_session(None)
+        # 清除回测页面的session
+        self.backtest_widget.set_session(None)
     
     def show_settings(self):
         """显示设置页面"""

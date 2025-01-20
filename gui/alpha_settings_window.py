@@ -180,6 +180,20 @@ class AlphaSettingsWindow(QWidget):
         param_group.setLayout(param_layout)
         settings_layout.addWidget(param_group)
 
+        # 添加保存和清空按钮
+        settings_buttons_layout = QHBoxLayout()
+        settings_buttons_layout.setSpacing(10)
+        
+        self.clear_settings_btn = QPushButton("清空设置")
+        self.clear_settings_btn.clicked.connect(self.clear_settings)
+        save_btn = QPushButton("保存")
+        save_btn.clicked.connect(self.save_settings)
+        
+        settings_buttons_layout.addWidget(self.clear_settings_btn)
+        settings_buttons_layout.addWidget(save_btn)
+        settings_buttons_layout.addStretch()
+        
+        settings_layout.addLayout(settings_buttons_layout)
         settings_group.setLayout(settings_layout)
         main_layout.addWidget(settings_group)
 
@@ -197,27 +211,24 @@ class AlphaSettingsWindow(QWidget):
         self.template_tree.itemSelectionChanged.connect(self._on_template_selected)
         templates_layout.addWidget(self.template_tree)
 
-        # 按钮布局
-        button_layout = QHBoxLayout()
-        button_layout.setSpacing(10)
+        # 模板按钮布局
+        template_button_layout = QHBoxLayout()
+        template_button_layout.setSpacing(10)
 
         # 模板操作按钮
         new_template_btn = QPushButton("新建模板")
         new_template_btn.clicked.connect(self.create_template)
-        self.clear_settings_btn = QPushButton("清空设置")
-        self.clear_settings_btn.clicked.connect(self.clear_settings)
         import_btn = QPushButton("导入模板")
         import_btn.clicked.connect(self.import_template)
         export_btn = QPushButton("导出模板")
         export_btn.clicked.connect(self.export_template)
 
-        button_layout.addWidget(new_template_btn)
-        button_layout.addWidget(self.clear_settings_btn)
-        button_layout.addWidget(import_btn)
-        button_layout.addWidget(export_btn)
-        button_layout.addStretch()
+        template_button_layout.addWidget(new_template_btn)
+        template_button_layout.addWidget(import_btn)
+        template_button_layout.addWidget(export_btn)
+        template_button_layout.addStretch()
 
-        templates_layout.addLayout(button_layout)
+        templates_layout.addLayout(template_button_layout)
         templates_group.setLayout(templates_layout)
 
         # 添加到主布局
@@ -355,8 +366,8 @@ class AlphaSettingsWindow(QWidget):
         if not self._validate_settings():
             return
             
-        current_text = self.template_tree.currentText()
-        if not current_text:  # 如果没有选中模板，提示另存为
+        current_item = self.template_tree.currentItem()
+        if not current_item or not current_item.parent():  # 如果没有选中模板或选中的是分类项，提示另存为
             reply = QMessageBox.question(
                 self,
                 "保存设置",
@@ -369,8 +380,7 @@ class AlphaSettingsWindow(QWidget):
             return
             
         try:
-            # 从显示文本中提取模板名称
-            template_name = current_text.split(" (")[0]
+            template_name = current_item.text(0)  # 获取第一列的文本作为模板名称
             settings = self.get_settings()
             self.config_manager.save_alpha_template(template_name, settings)
             QMessageBox.information(self, "保存成功", f"模板 '{template_name}' 已更新")
@@ -531,6 +541,11 @@ class AlphaSettingsWindow(QWidget):
         else:
             language = language.upper()
             
+        # 获取Alpha表达式并确保转换为{var}格式
+        alpha_expression = self.alpha_input.text()
+        if alpha_expression and '$' in alpha_expression:
+            alpha_expression = self.alpha_processor.format_expression(alpha_expression)
+            
         settings = {
             'language': language,
             'instrument_type': self.instrument_combo.currentText().upper(),
@@ -543,7 +558,7 @@ class AlphaSettingsWindow(QWidget):
             'pasteurization': self.past_combo.currentText().upper(),
             'unit_handling': self.unit_combo.currentText().upper(),
             'nan_handling': self.nan_combo.currentText().upper(),
-            'alpha_expression': self.alpha_processor.format_expression(self.alpha_input.text())
+            'alpha_expression': alpha_expression
         }
         return settings
         
@@ -581,9 +596,13 @@ class AlphaSettingsWindow(QWidget):
         self.unit_combo.setCurrentText(settings.get('unit_handling', 'VERIFY').title())
         self.nan_combo.setCurrentText(settings.get('nan_handling', 'ON').title())
         
-        # 设置Alpha表达式
+        # 设置Alpha表达式 - 确保从{var}格式转换为$var$格式
         if 'alpha_expression' in settings:
-            self.alpha_input.setText(settings['alpha_expression'])
+            expression = settings['alpha_expression']
+            # 如果表达式中包含{}，则需要转换为$$格式
+            if '{' in expression:
+                expression = self.alpha_processor.format_expression(expression)
+            self.alpha_input.setText(expression)
             
         # 触发表达式验证
         self._validate_expression()
