@@ -6,7 +6,7 @@ import os
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QGroupBox, 
                            QFormLayout, QLineEdit, QPushButton,
                            QComboBox, QLabel, QHBoxLayout, QMessageBox)
-from PyQt6.QtCore import Qt, pyqtSignal, QThread
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer
 from core.api import WQBrainAPI
 
 class LoginThread(QThread):
@@ -47,6 +47,31 @@ class LoginThread(QThread):
             
         except Exception as e:
             self.finished.emit(False, str(e))
+
+class AutoHideMessage(QLabel):
+    """自动隐藏的消息提示框"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # 设置样式
+        self.setStyleSheet("""
+            QLabel {
+                background-color: #4CAF50;
+                color: white;
+                padding: 10px;
+                border-radius: 5px;
+                font-size: 14px;
+            }
+        """)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # 默认隐藏
+        self.hide()
+        
+    def showMessage(self, text, duration=2000):
+        """显示消息，duration为显示时长(毫秒)"""
+        self.setText(text)
+        self.show()
+        # 创建定时器自动隐藏
+        QTimer.singleShot(duration, self.hide)
 
 class SettingsWidget(QWidget):
     """设置页面类"""
@@ -157,34 +182,23 @@ class SettingsWidget(QWidget):
             QMessageBox.critical(self, "错误", f"退出登录时出错: {str(e)}")
             
     def handle_login(self):
-        """处理登录请求"""
-        username = self.username_input.text()
-        password = self.password_input.text()
-        
-        if not username or not password:
-            self.login_button.setText("请输入用户名和密码")
-            return
-            
-        # 显示登录中状态
-        self.login_button.setEnabled(False)
-        self.login_button.setText("登录中...")
-        
-        # 创建并启动登录线程
-        self.login_thread = LoginThread(self.api, username, password)
-        self.login_thread.finished.connect(self.handle_login_result)
-        self.login_thread.user_info.connect(self.login_success.emit)
-        self.login_thread.start()
-        
-    def handle_login_result(self, success, message):
-        """处理登录结果"""
+        """处理登录"""
+        success, error_msg, user_id = self.api.login()
         if success:
-            self.login_button.setText("已登录")
-            self.login_button.setEnabled(False)
-            self.logout_button.setEnabled(True)
+            # 更新UI状态
+            self.update_login_status(True)
+            # 显示自动消失的成功提示
+            if not hasattr(self, 'message_label'):
+                self.message_label = AutoHideMessage(self)
+                # 将提示框添加到布局
+                self.layout().insertWidget(0, self.message_label)
+            self.message_label.showMessage(f"登录成功！欢迎回来，{user_id}")
+            # 发送登录成功信号
+            self.login_success.emit(user_id)
         else:
-            self.login_button.setText("登录")
-            self.login_button.setEnabled(True)
-            QMessageBox.warning(self, "登录失败", message)
+            # 显示错误消息
+            QMessageBox.critical(self, "登录失败", error_msg)
+            self.update_login_status(False)
     
     def handle_theme_change(self, theme):
         """处理主题更改"""
@@ -232,3 +246,16 @@ class SettingsWidget(QWidget):
                 if len(credentials) == 2:
                     self.username_input.setText(credentials[0])
                     # 不加载密码，出于安全考虑 
+
+    def update_login_status(self, is_logged_in):
+        """更新登录状态UI"""
+        if is_logged_in:
+            self.login_button.setText("已登录")
+            self.login_button.setEnabled(False)
+            self.logout_button.setEnabled(True)
+            # 清空密码输入框
+            self.password_input.clear()
+        else:
+            self.login_button.setText("登录")
+            self.login_button.setEnabled(True)
+            self.logout_button.setEnabled(False) 
