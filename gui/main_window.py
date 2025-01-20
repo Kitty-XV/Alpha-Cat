@@ -9,6 +9,7 @@ from .settings_window import SettingsWidget
 from .data_fields_window import DataFieldsWidget
 from .alpha_settings_window import AlphaSettingsWindow
 from .backtest_window import BacktestWindow
+from .batch_submit_window import BatchSubmitWindow
 
 class MainWindow(QMainWindow):
     """主窗口类"""
@@ -56,9 +57,8 @@ class MainWindow(QMainWindow):
         self.backtest_widget = BacktestWindow()
         self.stacked_widget.addWidget(self.backtest_widget)
         
-        self.batch_widget = QWidget()
-        self.batch_widget.setStyleSheet("background-color: #F5F5F5;")
-        self.stacked_widget.addWidget(self.batch_widget)
+        self.batch_submit_window = BatchSubmitWindow(self.settings_widget.api.session)
+        self.stacked_widget.addWidget(self.batch_submit_window)
         
         main_layout.addWidget(content_widget)
         
@@ -178,4 +178,4 @@ class MainWindow(QMainWindow):
     
     def show_batch(self):
         """显示批量提交页面"""
-        self.stacked_widget.setCurrentWidget(self.batch_widget) 
+        self.stacked_widget.setCurrentWidget(self.batch_submit_window) 

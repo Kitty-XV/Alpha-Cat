@@ -15,18 +15,20 @@ import re
 
 class BacktestThread(QThread):
     """回测线程"""
-    progress_signal = pyqtSignal(str)  # 进度信号
-    progress_value_signal = pyqtSignal(int)  # 进度值信号
-    finished_signal = pyqtSignal(dict)  # 完成信号，传递回测结果
+    progress_signal = pyqtSignal(str)  # 用于显示单个alpha的回测进度
+    progress_update = pyqtSignal(int, str)  # 用于更新总进度条 (总进度百分比, alpha信息)
+    finished_signal = pyqtSignal(dict)  # 回测完成信号
     error_signal = pyqtSignal(str)  # 错误信号
     field_progress_signal = pyqtSignal(int, int)  # 字段进度信号 (当前索引, 总数)
 
-    def __init__(self, alpha_template, data_field, session=None):
+    def __init__(self, session, alpha_template, data_field):
         super().__init__()
+        self.session = session
         self.alpha_template = alpha_template
         self.data_field = data_field
         self.config_manager = ConfigManager()
-        self.session = session
+        self.total_alphas = 373  # 总共需要回测的alpha数量
+        self.current_alpha = 0
         self._is_running = True  # 添加运行状态标志
         
     def stop(self):
@@ -68,15 +70,23 @@ class BacktestThread(QThread):
             self.progress_signal.emit(f"原始表达式: {template_data['alpha_expression']}")
             self.progress_signal.emit(f"字段总数: {len(field_ids)}")
             
-            # 依次测试每个字段
-            for i, field_id in enumerate(field_ids):
+            # 开始回测
+            total_fields = len(field_ids)
+            for i, field_id in enumerate(field_ids, 1):
                 if not self._is_running:
-                    self.progress_signal.emit("\n回测已停止")
-                    return  # 直接返回，不抛出异常
-                    
-                self.progress_signal.emit(f"\n\n=== 测试字段 [{i+1}/{len(field_ids)}] ===")
+                    return
+
+                # 更新总进度
+                total_progress = int((i - 1) / total_fields * 100)
+                self.progress_update.emit(total_progress, f"[{i}/{total_fields}]")
+                
+                self.current_alpha = i
+                progress = int((i / self.total_alphas) * 100)
+                self.progress_update.emit(progress, f"[{i:3d}/{self.total_alphas:3d}]")
+                
+                self.progress_signal.emit(f"\n\n=== 测试字段 [{i}/{len(field_ids)}] ===")
                 self.progress_signal.emit(f"字段ID: {field_id}")
-                self.field_progress_signal.emit(i + 1, len(field_ids))
+                self.field_progress_signal.emit(i, len(field_ids))
                 
                 # 检查字段ID是否包含vector
                 if "vector" in field_id.lower():
@@ -191,8 +201,9 @@ class BacktestThread(QThread):
                     progress_data = sim_progress_resp.json()
                     progress = progress_data.get('progress', 0)
                     if isinstance(progress, float):
-                        # 发送进度值
-                        self.progress_value_signal.emit(int(progress * 100))
+                        # 发送当前alpha的进度百分比
+                        progress_percent = int(progress * 100)
+                        self.progress_signal.emit(f"当前Alpha进度: {progress_percent}%")
                     
                     retry_after_sec = float(sim_progress_resp.headers.get("Retry-After", 0))
                     
@@ -273,11 +284,10 @@ class BacktestWindow(QWidget):
         
     def setup_ui(self):
         """初始化UI"""
-        # 创建主布局
-        main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(20, 20, 20, 20)
-        main_layout.setSpacing(15)
-
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
+        
         # 创建选择区域
         selection_group = QGroupBox("回测设置")
         selection_layout = QVBoxLayout()
@@ -299,30 +309,57 @@ class BacktestWindow(QWidget):
         selection_layout.addLayout(field_layout)
         
         selection_group.setLayout(selection_layout)
-        main_layout.addWidget(selection_group)
+        layout.addWidget(selection_group)
 
-        # 创建进度显示区域
+        # 进度显示区域
         progress_group = QGroupBox("回测进度")
         progress_layout = QVBoxLayout()
         
-        self.progress_text = QTextEdit()
-        self.progress_text.setReadOnly(True)
-        self.progress_text.setMinimumHeight(150)
-        progress_layout.addWidget(self.progress_text)
+        # 当前Alpha信息
+        self.current_alpha_label = QLabel("当前进度: ")
+        progress_layout.addWidget(self.current_alpha_label)
         
+        # 总体进度条
         self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setTextVisible(True)  # 显示百分比
-        self.progress_bar.setFormat("%p%")  # 设置进度条格式为百分比
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #ccc;
+                border-radius: 5px;
+                text-align: center;
+                height: 20px;
+            }
+            QProgressBar::chunk {
+                background-color: #0078D4;
+            }
+        """)
         progress_layout.addWidget(self.progress_bar)
         
-        # 添加字段进度标签
-        self.field_progress_label = QLabel("字段进度: 0/0")
-        progress_layout.addWidget(self.field_progress_label)
+        # 当前Alpha进度条
+        current_alpha_layout = QHBoxLayout()
+        current_alpha_layout.addWidget(QLabel("当前Alpha进度:"))
+        self.alpha_progress_bar = QProgressBar()
+        self.alpha_progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #ccc;
+                border-radius: 5px;
+                text-align: center;
+                height: 20px;
+            }
+            QProgressBar::chunk {
+                background-color: #00B294;
+            }
+        """)
+        current_alpha_layout.addWidget(self.alpha_progress_bar)
+        progress_layout.addLayout(current_alpha_layout)
         
         progress_group.setLayout(progress_layout)
-        main_layout.addWidget(progress_group)
+        layout.addWidget(progress_group)
+        
+        # 状态显示
+        self.status_text = QTextEdit()
+        self.status_text.setReadOnly(True)
+        self.status_text.setMaximumHeight(150)
+        layout.addWidget(self.status_text)
 
         # 创建按钮区域
         button_layout = QHBoxLayout()
@@ -336,10 +373,10 @@ class BacktestWindow(QWidget):
         button_layout.addWidget(self.stop_button)  # 添加到布局
         button_layout.addStretch()
         
-        main_layout.addLayout(button_layout)
-        main_layout.addStretch()
+        layout.addLayout(button_layout)
+        layout.addStretch()
         
-        self.setLayout(main_layout)
+        self.setLayout(layout)
         
     def load_templates_and_fields(self):
         """加载Alpha模板和数据字段"""
@@ -402,10 +439,10 @@ class BacktestWindow(QWidget):
         
     def append_progress(self, text):
         """添加进度信息"""
-        self.progress_text.append(text)
+        self.status_text.append(text)
         # 滚动到底部
-        self.progress_text.verticalScrollBar().setValue(
-            self.progress_text.verticalScrollBar().maximum()
+        self.status_text.verticalScrollBar().setValue(
+            self.status_text.verticalScrollBar().maximum()
         )
         
     def set_session(self, session):
@@ -415,31 +452,28 @@ class BacktestWindow(QWidget):
     def start_backtest(self):
         """开始回测"""
         if not self.session:
-            QMessageBox.warning(self, "错误", "请先登录")
+            QMessageBox.warning(self, "提示", "请先登录")
             return
             
-        if not self.template_combo.currentText() or not self.field_combo.currentText():
-            QMessageBox.warning(self, "错误", "请选择Alpha模板和数据字段")
-            return
-            
-        # 禁用开始按钮，启用停止按钮
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        self.progress_text.clear()
+        self.status_text.clear()
         self.progress_bar.setValue(0)
-        self.progress_bar.setRange(0, 100)
+        self.alpha_progress_bar.setValue(0)  # 重置Alpha进度条
+        self.current_alpha_label.setText("当前进度: ")
         
         # 创建并启动回测线程
-        self.backtest_thread = BacktestThread(
-            self.template_combo.currentText(),
-            self.field_combo.currentText(),
-            self.session
-        )
-        self.backtest_thread.progress_signal.connect(self.append_progress)
-        self.backtest_thread.progress_value_signal.connect(self.progress_bar.setValue)  # 连接进度值信号
+        self.backtest_thread = BacktestThread(self.session, 
+                                            self.template_combo.currentText(),
+                                            self.field_combo.currentText())
+        self.backtest_thread.progress_signal.connect(self.update_status)
+        self.backtest_thread.progress_update.connect(self.update_progress)
         self.backtest_thread.finished_signal.connect(self.handle_backtest_finished)
         self.backtest_thread.error_signal.connect(self.handle_backtest_error)
         self.backtest_thread.field_progress_signal.connect(self.update_field_progress)
+        
+        # 更新按钮状态
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        
         self.backtest_thread.start()
         
     def stop_backtest(self):
@@ -528,7 +562,29 @@ class BacktestWindow(QWidget):
         
     def update_field_progress(self, current, total):
         """更新字段进度"""
-        self.field_progress_label.setText(f"字段进度: {current}/{total}")
+        self.current_alpha_label.setText(f"当前进度: [{current}/{total}]")
         # 更新总体进度条
         total_progress = int((current - 1) / total * 100)
-        self.progress_bar.setValue(total_progress) 
+        self.progress_bar.setValue(total_progress)
+        
+    def update_status(self, status_text):
+        """更新当前Alpha进度"""
+        if "当前Alpha进度" in status_text:
+            # 从文本中提取进度值
+            try:
+                progress = int(status_text.split(":")[1].strip().replace("%", ""))
+                self.alpha_progress_bar.setValue(progress)
+            except:
+                pass
+        else:
+            # 其他信息显示在状态文本框中
+            self.status_text.append(status_text)
+            # 滚动到底部
+            self.status_text.verticalScrollBar().setValue(
+                self.status_text.verticalScrollBar().maximum()
+            )
+        
+    def update_progress(self, progress, alpha_info):
+        """更新总体进度"""
+        self.current_alpha_label.setText(f"当前进度: {alpha_info}")
+        self.progress_bar.setValue(progress) 
