@@ -1,0 +1,6 @@
+backtest:
+  results_path: "data/processed/backtest_results.csv"
+  template_path: "templates/alpha/"
+  min_sharpe: 1.0
+  min_fitness: 0.8
+  turnover_range: [0.03, 0.08] 

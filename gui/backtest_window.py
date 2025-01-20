@@ -3,7 +3,7 @@
 """
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                            QComboBox, QPushButton, QGroupBox, QTextEdit,
-                           QMessageBox, QProgressBar)
+                           QMessageBox, QProgressBar, QListView, QAbstractItemView)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from core.config_manager import ConfigManager
 import pandas as pd
@@ -12,6 +12,35 @@ import json
 import requests
 import time
 import re
+from typing import Dict, Tuple
+
+class ProgressManager:
+    """进度管理器，用于管理多个alpha的进度"""
+    def __init__(self):
+        self.alpha_progress: Dict[str, Tuple[float, str]] = {}  # {alpha_id: (progress, status)}
+        
+    def update_progress(self, alpha_id: str, progress: float, status: str = "运行中") -> None:
+        """更新某个alpha的进度"""
+        self.alpha_progress[alpha_id] = (progress, status)
+        
+    def remove_alpha(self, alpha_id: str) -> None:
+        """移除某个alpha的进度"""
+        if alpha_id in self.alpha_progress:
+            del self.alpha_progress[alpha_id]
+            
+    def get_overall_progress(self) -> float:
+        """获取总体进度"""
+        if not self.alpha_progress:
+            return 0.0
+        total_progress = sum(progress for progress, _ in self.alpha_progress.values())
+        return total_progress / len(self.alpha_progress)
+        
+    def get_status_text(self) -> str:
+        """获取所有alpha的状态文本"""
+        status_text = []
+        for alpha_id, (progress, status) in self.alpha_progress.items():
+            status_text.append(f"Alpha {alpha_id}: {progress:.1%} - {status}")
+        return "\n".join(status_text)
 
 class BacktestThread(QThread):
     """回测线程"""
@@ -30,10 +59,92 @@ class BacktestThread(QThread):
         self.total_alphas = 373  # 总共需要回测的alpha数量
         self.current_alpha = 0
         self._is_running = True  # 添加运行状态标志
+        self.progress_manager = ProgressManager()
+        self.active_requests = {}  # {alpha_id: (sim_progress_url, alpha_expression, field_id)}
+        self.max_concurrent = 3  # 默认并发数，会被外部设置
         
-    def stop(self):
-        """停止回测"""
-        self._is_running = False
+    def calculate_overall_progress(self, current_idx: int, total_fields: int) -> int:
+        """计算总体进度"""
+        # 基础进度：已完成的字段
+        base_progress = (current_idx / total_fields) * 100
+        
+        # 当前运行的alpha的进度贡献
+        if self.active_requests:
+            active_progress = sum(self.progress_manager.alpha_progress.get(str(idx), (0.0, ''))[0] 
+                                for idx in self.active_requests.keys())
+            active_contribution = (active_progress / len(self.active_requests)) * (100 / total_fields)
+            return int(base_progress + active_contribution)
+        
+        return int(base_progress)
+        
+    def get_running_simulations(self) -> int:
+        """获取当前正在运行的模拟数量"""
+        try:
+            response = self.session.get('https://api.worldquantbrain.com/simulations')
+            if response.status_code == 200:
+                data = response.json()
+                running_sims = [sim for sim in data if sim.get('status') == 'RUNNING']
+                self.progress_signal.emit(f"\n当前运行中的模拟数量: {len(running_sims)}")
+                return len(running_sims)
+            return 0
+        except Exception as e:
+            self.progress_signal.emit(f"\n获取运行中模拟数量失败: {str(e)}")
+            return 0
+            
+    def send_simulation_request(self, alpha_expression, template_data):
+        """发送模拟请求"""
+        # 处理truncation参数
+        truncation = float(template_data.get('truncation', 0)) / 100.0
+        
+        # 构建回测参数
+        simulation_data = {
+            'type': 'REGULAR',
+            'settings': {
+                'instrumentType': template_data.get('instrument_type', 'EQUITY'),
+                'region': template_data.get('region', 'USA'),
+                'universe': template_data.get('universe', 'TOP3000'),
+                'delay': int(template_data.get('delay', 1)),
+                'decay': int(template_data.get('decay', 0)),
+                'neutralization': template_data.get('neutralization', 'NONE'),
+                'truncation': truncation,
+                'pasteurization': template_data.get('pasteurization', 'ON'),
+                'unitHandling': template_data.get('unit_handling', 'VERIFY'),
+                'nanHandling': template_data.get('nan_handling', 'ON'),
+                'language': template_data.get('language', 'FASTEXPR'),
+                'visualization': False,
+            },
+            'regular': alpha_expression
+        }
+        
+        response = self.session.post(
+            'https://api.worldquantbrain.com/simulations',
+            json=simulation_data,
+            timeout=30
+        )
+        
+        if response.status_code in (200, 201):
+            return response.headers.get('Location')
+        elif response.status_code == 429:  # Rate limit
+            raise Exception("API请求频率限制，等待30秒后重试")
+        else:
+            raise Exception(f"回测请求失败: {response.text}")
+            
+    def check_simulation_progress(self, sim_progress_url):
+        """检查模拟进度"""
+        response = self.session.get(sim_progress_url, timeout=10)
+        if response.status_code != 200:
+            raise Exception(f"获取回测进度失败: {response.text}")
+            
+        progress_data = response.json()
+        # 添加详细的进度信息
+        if 'status' in progress_data:
+            self.progress_signal.emit(f"\n状态: {progress_data['status']}")
+        if 'message' in progress_data:
+            self.progress_signal.emit(f"消息: {progress_data['message']}")
+        if 'stage' in progress_data:
+            self.progress_signal.emit(f"阶段: {progress_data['stage']}")
+            
+        return progress_data
         
     def run(self):
         try:
@@ -46,11 +157,6 @@ class BacktestThread(QThread):
             if not template_data:
                 raise Exception(f"找不到模板: {self.alpha_template}")
                 
-            self.progress_signal.emit("\n=== 模板信息 ===")
-            self.progress_signal.emit(f"模板名称: {self.alpha_template}")
-            self.progress_signal.emit(f"原始表达式: {template_data['alpha_expression']}")
-            self.progress_signal.emit(f"模板参数: {json.dumps(template_data, ensure_ascii=False, indent=2)}")
-
             # 读取CSV文件中的所有字段ID
             fields_file = Path(f"data/raw/{self.data_field}.csv")
             if not fields_file.exists():
@@ -64,205 +170,109 @@ class BacktestThread(QThread):
             except Exception as e:
                 raise Exception(f"读取字段ID失败: {str(e)}")
                 
-            # 显示总体信息
-            self.progress_signal.emit("\n=== 回测信息 ===")
-            self.progress_signal.emit(f"模板名称: {self.alpha_template}")
-            self.progress_signal.emit(f"原始表达式: {template_data['alpha_expression']}")
-            self.progress_signal.emit(f"字段总数: {len(field_ids)}")
+            self.progress_signal.emit("\n=== 开始并行回测 ===")
+            self.progress_signal.emit(f"总字段数: {len(field_ids)}")
+            self.progress_signal.emit(f"并发数: {self.max_concurrent}")
             
-            # 开始回测
+            current_idx = 0
             total_fields = len(field_ids)
-            for i, field_id in enumerate(field_ids, 1):
-                if not self._is_running:
-                    return
-
-                # 更新总进度
-                total_progress = int((i - 1) / total_fields * 100)
-                self.progress_update.emit(total_progress, f"[{i}/{total_fields}]")
+            
+            while (current_idx < total_fields or self.active_requests) and self._is_running:
+                # 检查当前运行数量
+                running_count = self.get_running_simulations()
                 
-                self.current_alpha = i
-                progress = int((i / self.total_alphas) * 100)
-                self.progress_update.emit(progress, f"[{i:3d}/{self.total_alphas:3d}]")
-                
-                self.progress_signal.emit(f"\n\n=== 测试字段 [{i}/{len(field_ids)}] ===")
-                self.progress_signal.emit(f"字段ID: {field_id}")
-                self.field_progress_signal.emit(i, len(field_ids))
-                
-                # 检查字段ID是否包含vector
-                if "vector" in field_id.lower():
-                    self.progress_signal.emit(f"跳过vector字段: {field_id}")
+                # 如果达到并发限制，等待30秒
+                if running_count >= self.max_concurrent:
+                    self.progress_signal.emit("\n等待其他回测完成...")
+                    time.sleep(30)
                     continue
-                
-                # 构建alpha表达式
-                alpha_expression = template_data['alpha_expression']
-                if "{data}" in alpha_expression:
-                    alpha_expression = alpha_expression.replace("{data}", field_id)
-                else:
-                    alpha_expression = re.sub(r'\{[^}]+\}', field_id, alpha_expression)
-                
-                self.progress_signal.emit(f"表达式: {alpha_expression}")
-                
-                # 检查表达式格式
-                if not alpha_expression:
-                    raise Exception("Alpha表达式为空")
-                
-                # 处理truncation参数，将百分比转换为小数
-                truncation = float(template_data.get('truncation', 0)) / 100.0
-                
-                # 构建回测参数
-                simulation_data = {
-                    'type': 'REGULAR',
-                    'settings': {
-                        'instrumentType': template_data.get('instrument_type', 'EQUITY'),
-                        'region': template_data.get('region', 'USA'),
-                        'universe': template_data.get('universe', 'TOP3000'),
-                        'delay': int(template_data.get('delay', 1)),
-                        'decay': int(template_data.get('decay', 0)),
-                        'neutralization': template_data.get('neutralization', 'NONE'),
-                        'truncation': truncation,  # 使用转换后的小数值
-                        'pasteurization': template_data.get('pasteurization', 'ON'),
-                        'unitHandling': template_data.get('unit_handling', 'VERIFY'),
-                        'nanHandling': template_data.get('nan_handling', 'ON'),
-                        'language': template_data.get('language', 'FASTEXPR'),
-                        'visualization': False,
-                    },
-                    'regular': alpha_expression
-                }
-
-                # 打印请求信息
-                self.progress_signal.emit("\n=== 请求信息 ===")
-                self.progress_signal.emit(f"请求URL: https://api.worldquantbrain.com/simulations")
-                self.progress_signal.emit(f"请求数据:\n{json.dumps(simulation_data, ensure_ascii=False, indent=2)}")
-
-                # 发送回测请求
-                self.progress_signal.emit("\n正在发送回测请求...")
-                try:
-                    sim_resp = self.session.post(
-                        'https://api.worldquantbrain.com/simulations',
-                        json=simulation_data,
-                        timeout=30,  # 添加超时设置
-                        verify=True
-                    )
-                except requests.exceptions.SSLError:
-                    raise Exception("网络连接错误：请检查您的网络连接或代理设置")
-                except requests.exceptions.Timeout:
-                    raise Exception("连接超时：服务器响应时间过长，请稍后重试")
-                except requests.exceptions.ConnectionError:
-                    raise Exception("连接失败：无法连接到服务器，请检查网络设置")
-                except requests.exceptions.RequestException as e:
-                    if "Failed to resolve" in str(e):
-                        raise Exception("DNS解析失败：无法解析服务器地址，请检查网络连接或DNS设置")
-                    raise Exception(f"网络请求错误：{str(e)}")
-                
-                # 打印响应信息
-                self.progress_signal.emit("\n=== 响应信息 ===")
-                self.progress_signal.emit(f"状态码: {sim_resp.status_code}")
-                self.progress_signal.emit(f"响应头: {json.dumps(dict(sim_resp.headers), ensure_ascii=False, indent=2)}")
-                self.progress_signal.emit(f"响应内容: {sim_resp.text}")
-                
-                if sim_resp.status_code != 200 and sim_resp.status_code != 201:
-                    error_text = sim_resp.text
+                    
+                # 填充活跃请求直到达到并发限制
+                while len(self.active_requests) + running_count < self.max_concurrent and current_idx < total_fields and self._is_running:
+                    field_id = field_ids[current_idx]
+                    
+                    # 检查字段ID是否包含vector
+                    if "vector" in field_id.lower():
+                        self.progress_signal.emit(f"\n跳过vector字段: {field_id}")
+                        current_idx += 1
+                        continue
+                        
+                    # 构建alpha表达式
+                    alpha_expression = template_data['alpha_expression']
+                    if "{data}" in alpha_expression:
+                        alpha_expression = alpha_expression.replace("{data}", field_id)
+                    else:
+                        alpha_expression = re.sub(r'\{[^}]+\}', field_id, alpha_expression)
+                        
                     try:
-                        error_json = sim_resp.json()
-                        if isinstance(error_json, dict):
-                            error_text = json.dumps(error_json, ensure_ascii=False, indent=2)
-                    except:
-                        pass
-                    raise Exception(f"回测请求失败: {error_text}")
+                        # 发送新的模拟请求
+                        sim_progress_url = self.send_simulation_request(alpha_expression, template_data)
+                        if sim_progress_url:
+                            self.active_requests[current_idx] = (sim_progress_url, alpha_expression, field_id)
+                            self.progress_signal.emit(f"\n开始回测字段 [{current_idx + 1}/{total_fields}]: {field_id}")
+                            self.progress_manager.update_progress(str(current_idx), 0.0)
+                    except Exception as e:
+                        self.progress_signal.emit(f"\n字段 {field_id} 回测失败: {str(e)}")
+                        
+                    current_idx += 1
                     
-                if 'Location' not in sim_resp.headers:
-                    raise Exception("回测请求失败，未返回进度URL")
-                    
-                sim_progress_url = sim_resp.headers['Location']
-                self.progress_signal.emit(f"\n进度URL: {sim_progress_url}")
-                
-                # 轮询回测进度
-                while self._is_running:
+                # 检查所有活跃请求的状态
+                completed_requests = []
+                for idx, (sim_progress_url, alpha_expression, field_id) in list(self.active_requests.items()):
                     try:
-                        sim_progress_resp = self.session.get(
-                            sim_progress_url,
-                            timeout=10,
-                            verify=True
-                        )
-                    except requests.exceptions.SSLError:
-                        raise Exception("网络连接错误：请检查您的网络连接或代理设置")
-                    except requests.exceptions.Timeout:
-                        raise Exception("获取进度超时：服务器响应时间过长，请稍后重试")
-                    except requests.exceptions.ConnectionError:
-                        raise Exception("连接失败：无法连接到服务器，请检查网络设置")
-                    except requests.exceptions.RequestException as e:
-                        if "Failed to resolve" in str(e):
-                            raise Exception("DNS解析失败：无法解析服务器地址，请检查网络连接或DNS设置")
-                        raise Exception(f"获取进度时发生错误：{str(e)}")
-                    
-                    if sim_progress_resp.status_code != 200:
-                        raise Exception(f"获取回测进度失败: {sim_progress_resp.text}")
+                        progress_data = self.check_simulation_progress(sim_progress_url)
+                        progress = progress_data.get('progress', 0)
                         
-                    progress_data = sim_progress_resp.json()
-                    progress = progress_data.get('progress', 0)
-                    if isinstance(progress, float):
-                        # 发送当前alpha的进度百分比
-                        progress_percent = int(progress * 100)
-                        self.progress_signal.emit(f"当前Alpha进度: {progress_percent}%")
-                    
-                    retry_after_sec = float(sim_progress_resp.headers.get("Retry-After", 0))
-                    
-                    if retry_after_sec == 0:  # 回测完成
-                        if progress_data.get('status') == 'ERROR':
-                            raise Exception(f"回测失败: {progress_data.get('message', '未知错误')}")
-                        
-                        # 获取alpha结果
-                        alpha_id = progress_data.get('alpha')
-                        if not alpha_id:
-                            raise Exception(f"回测结果格式错误: {progress_data}")
+                        if isinstance(progress, float):
+                            self.progress_manager.update_progress(str(idx), progress)
+                            self.progress_signal.emit(f"Alpha {idx} ({field_id}) 进度: {progress:.1%}")
                             
-                        # 获取详细结果
-                        self.progress_signal.emit("\n正在获取详细结果...")
-                        result_resp = self.session.get(f'https://api.worldquantbrain.com/alphas/{alpha_id}')
-                        
-                        if result_resp.status_code != 200:
-                            raise Exception(f"获取回测结果失败: {result_resp.text}")
+                        status = progress_data.get('status', '')
+                        if status == 'ERROR':
+                            self.progress_signal.emit(f"\nAlpha {idx} ({field_id}) 回测失败: {progress_data.get('message', '未知错误')}")
+                            completed_requests.append(idx)
+                            continue
                             
-                        result = result_resp.json()
-                        
-                        # 发送完整的API响应结果
-                        self.finished_signal.emit(result)
-                        
-                        # 显示基本信息
-                        self.progress_signal.emit("\n=== 回测结果 ===")
-                        self.progress_signal.emit(f"Alpha ID: {result.get('id', '')}")
-                        self.progress_signal.emit(f"创建时间: {result.get('dateCreated', '')}")
-                        self.progress_signal.emit(f"表达式: {result.get('regular', {}).get('code', '')}")
-                        
-                        # 显示检查结果
-                        checks = result.get('is', {}).get('checks', [])
-                        self.progress_signal.emit("\n检查项结果：")
-                        for check in checks:
-                            name = check.get('name')
-                            result_val = check.get('result')
-                            value = check.get('value', 'N/A')
-                            self.progress_signal.emit(f"{name}: {result_val} (值: {value})")
-                        
-                        # 等待一秒再继续下一个字段
-                        time.sleep(1)
-                        
-                        break
-                        
-                    self.progress_signal.emit(f"回测进行中，等待 {retry_after_sec} 秒...")
+                        # 检查是否完成
+                        if status == 'COMPLETE' or progress == 1.0:
+                            alpha_id = progress_data.get('alpha')
+                            if alpha_id:
+                                # 获取详细结果
+                                result_resp = self.session.get(f'https://api.worldquantbrain.com/alphas/{alpha_id}')
+                                if result_resp.status_code == 200:
+                                    result = result_resp.json()
+                                    self.finished_signal.emit(result)
+                                    self.progress_signal.emit(f"\nAlpha {idx} ({field_id}) 回测完成!")
+                                    
+                            completed_requests.append(idx)
+                            
+                    except Exception as e:
+                        self.progress_signal.emit(f"\nAlpha {idx} ({field_id}) 检查进度失败: {str(e)}")
+                        if "404 Client Error" in str(e):  # 如果模拟已经不存在
+                            completed_requests.append(idx)
+                            
+                # 移除已完成的请求
+                for idx in completed_requests:
+                    del self.active_requests[idx]
+                    self.progress_manager.remove_alpha(str(idx))
                     
-                    # 分段休眠，以便能够及时响应停止请求
-                    for _ in range(2):
-                        if not self._is_running:
-                            self.progress_signal.emit("\n回测已停止")
-                            return  # 直接返回，不抛出异常
-                        time.sleep(0.5)
-
-            if self._is_running:  # 只有在正常完成时才发送完成消息
+                # 更新总体进度
+                overall_progress = self.calculate_overall_progress(current_idx - len(self.active_requests), total_fields)
+                self.progress_update.emit(overall_progress, f"[{current_idx}/{total_fields}]")
+                
+                # 避免过度请求
+                time.sleep(5)
+                
+            if self._is_running:
                 self.progress_signal.emit("\n全部字段测试完成！")
                 
         except Exception as e:
-            if self._is_running:  # 只有在非停止状态下才发送错误
+            if self._is_running:
                 self.error_signal.emit(str(e))
+                
+    def stop(self):
+        """停止回测"""
+        self._is_running = False
 
 class BacktestWindow(QWidget):
     """回测窗口类"""
@@ -296,6 +306,9 @@ class BacktestWindow(QWidget):
         template_layout = QHBoxLayout()
         template_label = QLabel("Alpha模板:")
         self.template_combo = QComboBox()
+        # 设置下拉列表始终从第一项开始显示
+        self.template_combo.setView(QListView())
+        self.template_combo.view().setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         template_layout.addWidget(template_label)
         template_layout.addWidget(self.template_combo)
         selection_layout.addLayout(template_layout)
@@ -304,9 +317,27 @@ class BacktestWindow(QWidget):
         field_layout = QHBoxLayout()
         field_label = QLabel("数据字段:")
         self.field_combo = QComboBox()
+        # 设置下拉列表始终从第一项开始显示
+        self.field_combo.setView(QListView())
+        self.field_combo.view().setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         field_layout.addWidget(field_label)
         field_layout.addWidget(self.field_combo)
         selection_layout.addLayout(field_layout)
+        
+        # 并发数选择
+        concurrency_layout = QHBoxLayout()
+        concurrency_label = QLabel("并发数:")
+        self.concurrency_combo = QComboBox()
+        # 设置下拉列表始终从第一项开始显示
+        self.concurrency_combo.setView(QListView())
+        self.concurrency_combo.view().setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.concurrency_combo.addItems(['1', '2', '3', '4', '5'])
+        self.concurrency_combo.setCurrentText('3')  # 默认值为3
+        # 添加并发数变化响应
+        self.concurrency_combo.currentTextChanged.connect(self.on_concurrency_changed)
+        concurrency_layout.addWidget(concurrency_label)
+        concurrency_layout.addWidget(self.concurrency_combo)
+        selection_layout.addLayout(concurrency_layout)
         
         selection_group.setLayout(selection_layout)
         layout.addWidget(selection_group)
@@ -315,11 +346,9 @@ class BacktestWindow(QWidget):
         progress_group = QGroupBox("回测进度")
         progress_layout = QVBoxLayout()
         
-        # 当前Alpha信息
-        self.current_alpha_label = QLabel("当前进度: ")
-        progress_layout.addWidget(self.current_alpha_label)
-        
-        # 总体进度条
+        # 总体进度
+        total_progress_layout = QHBoxLayout()
+        total_progress_layout.addWidget(QLabel("总体进度:"))
         self.progress_bar = QProgressBar()
         self.progress_bar.setStyleSheet("""
             QProgressBar {
@@ -332,25 +361,46 @@ class BacktestWindow(QWidget):
                 background-color: #0078D4;
             }
         """)
-        progress_layout.addWidget(self.progress_bar)
+        total_progress_layout.addWidget(self.progress_bar)
+        progress_layout.addLayout(total_progress_layout)
         
-        # 当前Alpha进度条
-        current_alpha_layout = QHBoxLayout()
-        current_alpha_layout.addWidget(QLabel("当前Alpha进度:"))
-        self.alpha_progress_bar = QProgressBar()
-        self.alpha_progress_bar.setStyleSheet("""
-            QProgressBar {
-                border: 1px solid #ccc;
-                border-radius: 5px;
-                text-align: center;
-                height: 20px;
-            }
-            QProgressBar::chunk {
-                background-color: #00B294;
-            }
-        """)
-        current_alpha_layout.addWidget(self.alpha_progress_bar)
-        progress_layout.addLayout(current_alpha_layout)
+        # 当前运行的Alpha进度
+        self.alpha_progress_group = QGroupBox("当前运行的Alpha")
+        self.alpha_progress_layout = QVBoxLayout()  # 改为实例变量
+        
+        # 创建5个进度条用于显示并行的Alpha进度（最大支持5个并发）
+        self.alpha_progress_bars = []
+        self.alpha_labels = []
+        for i in range(5):
+            alpha_layout = QHBoxLayout()
+            label = QLabel(f"Alpha {i+1}:")
+            progress_bar = QProgressBar()
+            progress_bar.setStyleSheet("""
+                QProgressBar {
+                    border: 1px solid #ccc;
+                    border-radius: 5px;
+                    text-align: center;
+                    height: 15px;
+                }
+                QProgressBar::chunk {
+                    background-color: #00B294;
+                }
+            """)
+            alpha_layout.addWidget(label)
+            alpha_layout.addWidget(progress_bar)
+            self.alpha_progress_layout.addLayout(alpha_layout)
+            self.alpha_progress_bars.append(progress_bar)
+            self.alpha_labels.append(label)
+            
+            # 默认隐藏所有进度条
+            label.setVisible(False)
+            progress_bar.setVisible(False)
+            
+        self.alpha_progress_group.setLayout(self.alpha_progress_layout)
+        progress_layout.addWidget(self.alpha_progress_group)
+        
+        # 显示默认数量的进度条
+        self.update_progress_bars_visibility(int(self.concurrency_combo.currentText()))
         
         progress_group.setLayout(progress_layout)
         layout.addWidget(progress_group)
@@ -358,92 +408,84 @@ class BacktestWindow(QWidget):
         # 状态显示
         self.status_text = QTextEdit()
         self.status_text.setReadOnly(True)
-        self.status_text.setMaximumHeight(150)
+        self.status_text.setMaximumHeight(200)
         layout.addWidget(self.status_text)
 
         # 创建按钮区域
         button_layout = QHBoxLayout()
         self.start_button = QPushButton("开始回测")
-        self.stop_button = QPushButton("停止回测")  # 添加停止按钮
-        self.stop_button.setEnabled(False)  # 初始状态禁用
+        self.stop_button = QPushButton("停止回测")
+        self.stop_button.setEnabled(False)
         self.start_button.clicked.connect(self.start_backtest)
-        self.stop_button.clicked.connect(self.stop_backtest)  # 连接停止信号
+        self.stop_button.clicked.connect(self.stop_backtest)
         button_layout.addStretch()
         button_layout.addWidget(self.start_button)
-        button_layout.addWidget(self.stop_button)  # 添加到布局
+        button_layout.addWidget(self.stop_button)
         button_layout.addStretch()
         
         layout.addLayout(button_layout)
         layout.addStretch()
         
-        self.setLayout(layout)
+    def on_concurrency_changed(self, value):
+        """并发数变化时的响应"""
+        concurrency = int(value)
+        self.update_progress_bars_visibility(concurrency)
         
-    def load_templates_and_fields(self):
-        """加载Alpha模板和数据字段"""
-        # 保存当前选择
-        current_template = self.template_combo.currentText()
-        current_field = self.field_combo.currentText()
-        
-        # 加载Alpha模板
-        templates = self.config_manager.load_alpha_templates()
-        self.template_combo.clear()
-        self.template_combo.addItems(templates.keys())
-        
-        # 恢复之前的选择（如果还存在）
-        index = self.template_combo.findText(current_template)
-        if index >= 0:
-            self.template_combo.setCurrentIndex(index)
-            
-        # 加载数据字段
-        try:
-            # 获取raw目录下所有的csv文件
-            raw_dir = Path("data/raw")
-            if raw_dir.exists():
-                csv_files = [f.stem for f in raw_dir.glob("*.csv") if f.is_file()]
-                self.field_combo.clear()
-                self.field_combo.addItems(csv_files)
+    def update_progress_bars_visibility(self, concurrency):
+        """更新进度条的可见性"""
+        for i in range(5):
+            visible = i < concurrency
+            self.alpha_labels[i].setVisible(visible)
+            self.alpha_progress_bars[i].setVisible(visible)
+            if visible:
+                self.alpha_labels[i].setText(f"Alpha {i+1}:")
+                self.alpha_progress_bars[i].setValue(0)
+                self.alpha_progress_bars[i].setFormat("")
                 
-                # 恢复之前的选择（如果还存在）
-                index = self.field_combo.findText(current_field)
-                if index >= 0:
-                    self.field_combo.setCurrentIndex(index)
-                    
-        except Exception as e:
-            print(f"加载数据字段时出错: {str(e)}")  # 只打印错误，不弹窗
+    def update_alpha_progress(self, alpha_id, progress, status="运行中"):
+        """更新单个Alpha的进度"""
+        try:
+            concurrency = int(self.concurrency_combo.currentText())
+            idx = int(alpha_id) % concurrency  # 使用当前并发数取模
+            if idx < len(self.alpha_labels) and self.alpha_labels[idx].isVisible():
+                self.alpha_labels[idx].setText(f"Alpha {alpha_id}:")
+                self.alpha_progress_bars[idx].setValue(int(progress * 100))
+                self.alpha_progress_bars[idx].setFormat(f"{progress:.1%} - {status}")
+        except (ValueError, IndexError):
+            pass
             
-    def showEvent(self, event):
-        """窗口显示时触发"""
-        super().showEvent(event)
-        self.update_timer.start()  # 启动定时器
-        self.load_templates_and_fields()  # 立即加载一次
-        
-        # 如果回测正在运行，更新UI状态
-        if self.backtest_thread and self.backtest_thread.isRunning():
-            self.start_button.setEnabled(False)
-            self.stop_button.setEnabled(True)
-        else:
-            self.start_button.setEnabled(True)
-            self.stop_button.setEnabled(False)
-        
-    def hideEvent(self, event):
-        """窗口隐藏时触发"""
-        super().hideEvent(event)
-        self.update_timer.stop()  # 只停止定时器，不停止回测
-        
-    def closeEvent(self, event):
-        """窗口关闭时触发"""
-        if self.backtest_thread and self.backtest_thread.isRunning():
-            self.backtest_thread.stop()
-            self.backtest_thread.wait()  # 等待线程结束
-        super().closeEvent(event)
-        
-    def append_progress(self, text):
-        """添加进度信息"""
-        self.status_text.append(text)
+    def clear_alpha_progress(self, alpha_id):
+        """清除单个Alpha的进度显示"""
+        try:
+            concurrency = int(self.concurrency_combo.currentText())
+            idx = int(alpha_id) % concurrency
+            if idx < len(self.alpha_labels) and self.alpha_labels[idx].isVisible():
+                self.alpha_labels[idx].setText(f"Alpha {idx+1}:")
+                self.alpha_progress_bars[idx].setValue(0)
+                self.alpha_progress_bars[idx].setFormat("")
+        except (ValueError, IndexError):
+            pass
+            
+    def update_status(self, status_text):
+        """更新状态文本"""
+        self.status_text.append(status_text)
         # 滚动到底部
         self.status_text.verticalScrollBar().setValue(
             self.status_text.verticalScrollBar().maximum()
         )
+        
+        # 解析进度信息
+        if "Alpha" in status_text and "进度" in status_text:
+            try:
+                alpha_id = status_text.split("Alpha")[1].split()[0]
+                progress = float(status_text.split(":")[1].strip().replace("%", "")) / 100
+                self.update_alpha_progress(alpha_id, progress)
+            except:
+                pass
+                
+    def update_progress(self, progress, alpha_info):
+        """更新总体进度"""
+        self.progress_bar.setValue(progress)
         
     def set_session(self, session):
         """设置session"""
@@ -457,18 +499,24 @@ class BacktestWindow(QWidget):
             
         self.status_text.clear()
         self.progress_bar.setValue(0)
-        self.alpha_progress_bar.setValue(0)  # 重置Alpha进度条
-        self.current_alpha_label.setText("当前进度: ")
+        
+        # 获取选择的并发数
+        concurrency = int(self.concurrency_combo.currentText())
+        
+        # 更新进度条显示
+        self.update_progress_bars_visibility(concurrency)
         
         # 创建并启动回测线程
         self.backtest_thread = BacktestThread(self.session, 
                                             self.template_combo.currentText(),
                                             self.field_combo.currentText())
+        # 设置并发数
+        self.backtest_thread.max_concurrent = concurrency
+        
         self.backtest_thread.progress_signal.connect(self.update_status)
         self.backtest_thread.progress_update.connect(self.update_progress)
         self.backtest_thread.finished_signal.connect(self.handle_backtest_finished)
         self.backtest_thread.error_signal.connect(self.handle_backtest_error)
-        self.backtest_thread.field_progress_signal.connect(self.update_field_progress)
         
         # 更新按钮状态
         self.start_button.setEnabled(False)
@@ -483,7 +531,13 @@ class BacktestWindow(QWidget):
             self.append_progress("\n正在停止回测...")
             self.stop_button.setEnabled(False)
             self.start_button.setEnabled(True)
-            self.progress_bar.setValue(0)  # 重置进度条
+            self.progress_bar.setValue(0)
+            
+            # 清除所有Alpha进度显示
+            for i in range(5):  # 修改为5，匹配最大并发数
+                self.alpha_labels[i].setText(f"Alpha {i+1}:")
+                self.alpha_progress_bars[i].setValue(0)
+                self.alpha_progress_bars[i].setFormat("")
         
     def handle_backtest_finished(self, result):
         """处理回测完成"""
@@ -546,45 +600,76 @@ class BacktestWindow(QWidget):
             self.append_progress(f"\n保存结果时出错: {str(e)}")
             QMessageBox.critical(self, "保存失败", f"保存回测结果时发生错误：{str(e)}")
         
-        # 只有当回测线程已经结束时才启用开始按钮
-        if not self.backtest_thread or not self.backtest_thread.isRunning():
-            self.start_button.setEnabled(True)
-            self.stop_button.setEnabled(False)
-            self.progress_bar.setValue(100)
-        
     def handle_backtest_error(self, error_msg):
         """处理回测错误"""
-        self.progress_bar.setValue(0)  # 重置进度条
+        self.progress_bar.setValue(0)
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.append_progress(f"\n错误: {error_msg}")
         QMessageBox.critical(self, "回测失败", f"回测过程中发生错误：{error_msg}")
         
-    def update_field_progress(self, current, total):
-        """更新字段进度"""
-        self.current_alpha_label.setText(f"当前进度: [{current}/{total}]")
-        # 更新总体进度条
-        total_progress = int((current - 1) / total * 100)
-        self.progress_bar.setValue(total_progress)
+    def append_progress(self, text):
+        """添加进度信息"""
+        self.status_text.append(text)
+        # 滚动到底部
+        self.status_text.verticalScrollBar().setValue(
+            self.status_text.verticalScrollBar().maximum()
+        )
         
-    def update_status(self, status_text):
-        """更新当前Alpha进度"""
-        if "当前Alpha进度" in status_text:
-            # 从文本中提取进度值
-            try:
-                progress = int(status_text.split(":")[1].strip().replace("%", ""))
-                self.alpha_progress_bar.setValue(progress)
-            except:
-                pass
+    def showEvent(self, event):
+        """窗口显示时触发"""
+        super().showEvent(event)
+        self.update_timer.start()
+        self.load_templates_and_fields()
+        
+        if self.backtest_thread and self.backtest_thread.isRunning():
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
         else:
-            # 其他信息显示在状态文本框中
-            self.status_text.append(status_text)
-            # 滚动到底部
-            self.status_text.verticalScrollBar().setValue(
-                self.status_text.verticalScrollBar().maximum()
-            )
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
         
-    def update_progress(self, progress, alpha_info):
-        """更新总体进度"""
-        self.current_alpha_label.setText(f"当前进度: {alpha_info}")
-        self.progress_bar.setValue(progress) 
+    def hideEvent(self, event):
+        """窗口隐藏时触发"""
+        super().hideEvent(event)
+        self.update_timer.stop()
+        
+    def closeEvent(self, event):
+        """窗口关闭时触发"""
+        if self.backtest_thread and self.backtest_thread.isRunning():
+            self.backtest_thread.stop()
+            self.backtest_thread.wait()
+        super().closeEvent(event)
+        
+    def load_templates_and_fields(self):
+        """加载Alpha模板和数据字段"""
+        # 保存当前选择
+        current_template = self.template_combo.currentText()
+        current_field = self.field_combo.currentText()
+        
+        # 加载Alpha模板
+        templates = self.config_manager.load_alpha_templates()
+        self.template_combo.clear()
+        self.template_combo.addItems(templates.keys())
+        
+        # 恢复之前的选择（如果还存在）
+        index = self.template_combo.findText(current_template)
+        if index >= 0:
+            self.template_combo.setCurrentIndex(index)
+            
+        # 加载数据字段
+        try:
+            # 获取raw目录下所有的csv文件
+            raw_dir = Path("data/raw")
+            if raw_dir.exists():
+                csv_files = [f.stem for f in raw_dir.glob("*.csv") if f.is_file()]
+                self.field_combo.clear()
+                self.field_combo.addItems(csv_files)
+                
+                # 恢复之前的选择（如果还存在）
+                index = self.field_combo.findText(current_field)
+                if index >= 0:
+                    self.field_combo.setCurrentIndex(index)
+                    
+        except Exception as e:
+            print(f"加载数据字段时出错: {str(e)}")  # 只打印错误，不弹窗 

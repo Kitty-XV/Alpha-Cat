@@ -1,7 +1,7 @@
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTextEdit, 
                            QPushButton, QLabel, QLineEdit, QMessageBox, QProgressBar,
                            QTableWidget, QTableWidgetItem, QHeaderView)
-from PyQt6.QtCore import QThread, pyqtSignal, Qt
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer
 import pandas as pd
 from pathlib import Path
 import datetime
@@ -79,8 +79,16 @@ class BatchSubmitWindow(QWidget):
         super().__init__()
         self.session = session
         self.results_file = Path("data/processed/backtest_results.csv")
+        self.last_modified_time = None
         self.setup_ui()
-        self.load_results()
+        
+        # 创建文件监视定时器
+        self.file_watcher = QTimer()
+        self.file_watcher.timeout.connect(self.check_file_changes)
+        self.file_watcher.start(1000)  # 每秒检查一次
+        
+        # 初始加载数据
+        self.load_data()
         
     def setup_ui(self):
         """初始化UI"""
@@ -168,7 +176,17 @@ class BatchSubmitWindow(QWidget):
         self.status_text.setMaximumHeight(150)
         layout.addWidget(self.status_text)
         
-    def load_results(self):
+    def check_file_changes(self):
+        """检查CSV文件是否发生变化"""
+        if not self.results_file.exists():
+            return
+            
+        current_mtime = self.results_file.stat().st_mtime
+        if self.last_modified_time is None or current_mtime > self.last_modified_time:
+            self.last_modified_time = current_mtime
+            self.load_data()
+            
+    def load_data(self):
         """加载回测结果到表格"""
         try:
             if not self.results_file.exists():
@@ -304,7 +322,18 @@ class BatchSubmitWindow(QWidget):
             df.to_csv(self.results_file, index=False)
             
             # 刷新表格显示
-            self.load_results()
+            self.load_data()
             
         except Exception as e:
-            self.update_status(f"标记提交状态失败: {str(e)}") 
+            self.update_status(f"标记提交状态失败: {str(e)}")
+
+    def showEvent(self, event):
+        """窗口显示时触发"""
+        super().showEvent(event)
+        self.file_watcher.start()
+        self.load_data()
+        
+    def hideEvent(self, event):
+        """窗口隐藏时触发"""
+        super().hideEvent(event)
+        self.file_watcher.stop() 
