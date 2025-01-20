@@ -24,6 +24,9 @@ wheels/
 venv/
 env/
 ENV/
+.WQBrain/
+.design/
+WQBrain/
 
 # IDE
 .idea/
